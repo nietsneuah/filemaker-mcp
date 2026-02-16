@@ -1,0 +1,124 @@
+"""Parse FileMaker GetTableDDL() output into FieldDef dicts.
+
+Converts raw SQL DDL (CREATE TABLE statements) into the structured
+FieldDef format used by the schema tools. Handles FM-specific type
+mapping and applies tier heuristics for field classification.
+
+Type mapping:
+  varchar(255)     -> text
+  int              -> number
+  datetime         -> datetime
+  varbinary(4096)  -> binary
+
+Tier heuristics:
+  _kp_*            -> key + pk
+  _kf_*            -> key + fk
+  _sp_*            -> internal (speed/UI cache)
+  g + uppercase    -> internal (global)
+  G_*              -> internal (global)
+"""
+
+import re
+
+from filemaker_mcp.ddl import FieldDef, TableSchema
+
+# Regex patterns for DDL parsing
+_CREATE_TABLE_RE = re.compile(
+    r'CREATE\s+TABLE\s+"([^"]+)"\s*\((.*?)\);',
+    re.DOTALL | re.IGNORECASE,
+)
+_FIELD_RE = re.compile(
+    r'"([^"]+)"\s+(varchar\(\d+\)|int|datetime|varbinary\(\d+\))',
+    re.IGNORECASE,
+)
+_PK_RE = re.compile(r"PRIMARY\s+KEY\s*\(([^)]+)\)", re.IGNORECASE)
+_FK_RE = re.compile(r"FOREIGN\s+KEY\s*\(([^)]+)\)", re.IGNORECASE)
+
+# FM SQL type -> our type system
+_TYPE_MAP: dict[str, str] = {
+    "varchar": "text",
+    "int": "number",
+    "datetime": "datetime",
+    "varbinary": "binary",
+}
+
+
+def _map_type(sql_type: str) -> str:
+    """Map FM SQL type to our simplified type system."""
+    base = sql_type.split("(")[0].lower()
+    return _TYPE_MAP.get(base, "text")
+
+
+def _assign_tier(field_name: str) -> str:
+    """Apply tier heuristics based on field name conventions."""
+    if field_name.startswith("_kp_") or field_name.startswith("_kf_"):
+        return "key"
+    if field_name.startswith("_sp_"):
+        return "internal"
+    # g + uppercase letter = global (e.g., gGlobal, gDate)
+    if len(field_name) > 1 and field_name[0] == "g" and field_name[1].isupper():
+        return "internal"
+    if field_name.startswith("G_"):
+        return "internal"
+    return "standard"
+
+
+def parse_ddl(ddl_text: str) -> dict[str, TableSchema]:
+    """Parse DDL text into structured table/field definitions.
+
+    Args:
+        ddl_text: Raw DDL from GetTableDDL() — one or more CREATE TABLE statements.
+
+    Returns:
+        Dict mapping table_name -> {field_name: FieldDef}.
+    """
+    if not ddl_text.strip():
+        return {}
+
+    tables: dict[str, TableSchema] = {}
+
+    for match in _CREATE_TABLE_RE.finditer(ddl_text):
+        table_name = match.group(1)
+        body = match.group(2)
+
+        # Extract PRIMARY KEY fields
+        pk_fields: set[str] = set()
+        for pk_match in _PK_RE.finditer(body):
+            for pk_name in pk_match.group(1).split(","):
+                pk_fields.add(pk_name.strip().strip('"'))
+
+        # Extract FOREIGN KEY fields
+        fk_fields: set[str] = set()
+        for fk_match in _FK_RE.finditer(body):
+            for fk_name in fk_match.group(1).split(","):
+                fk_fields.add(fk_name.strip().strip('"'))
+
+        # Parse field definitions
+        fields: TableSchema = {}
+        for field_match in _FIELD_RE.finditer(body):
+            field_name = field_match.group(1)
+            sql_type = field_match.group(2)
+
+            field_def: FieldDef = {
+                "type": _map_type(sql_type),
+                "tier": _assign_tier(field_name),
+            }
+
+            # Apply PK/FK from constraints
+            if field_name in pk_fields:
+                field_def["pk"] = True
+            if field_name in fk_fields:
+                field_def["fk"] = True
+
+            # _kp_ fields always get pk=True even without PK constraint
+            if field_name.startswith("_kp_") and "pk" not in field_def:
+                field_def["pk"] = True
+            # _kf_ fields always get fk=True even without FK constraint
+            if field_name.startswith("_kf_") and "fk" not in field_def:
+                field_def["fk"] = True
+
+            fields[field_name] = field_def
+
+        tables[table_name] = fields
+
+    return tables

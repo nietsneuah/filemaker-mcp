@@ -1,0 +1,1 @@
+"""FileMaker MCP Server tests."""
