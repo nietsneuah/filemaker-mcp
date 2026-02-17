@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     @property
     def odata_base_url(self) -> str:
