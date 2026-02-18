@@ -473,12 +473,12 @@ async def bootstrap_ddl() -> None:
         logger.info("DDL bootstrap step 1: script probe succeeded")
     except ValueError as e:
         if "not found" in str(e).lower():
-            logger.info("DDL bootstrap step 1: script not found, using static DDL")
+            logger.info("DDL bootstrap step 1: script not found, falling through to OData discovery")
             set_script_available(False)
-            return
-        # Other ValueError — script exists but errored, continue
-        set_script_available(True)
-        logger.warning("DDL bootstrap step 1: probe returned error, continuing: %s", e)
+        else:
+            # Other ValueError — script exists but errored, continue
+            set_script_available(True)
+            logger.warning("DDL bootstrap step 1: probe returned error, continuing: %s", e)
     except PermissionError:
         logger.error("DDL bootstrap step 1: authentication failed, skipping bootstrap")
         return
