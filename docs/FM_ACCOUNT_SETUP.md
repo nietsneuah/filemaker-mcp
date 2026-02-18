@@ -27,7 +27,7 @@
 - ☑ `fmodata` — OData API access
 
 **Scripts:**
-- Phase 1: Grant access to `SCR_DDL_GetTableDDL` (optional, for rich schema)
+- ☑ Grant access to `SCR_DDL_GetTableDDL` (required for schema discovery — see below)
 - Phase 2: Grant access to additional scripts for AI execution
 
 ### Verify Access
@@ -53,11 +53,12 @@ You should see XML with EntityType definitions for your tables.
 
 ---
 
-## Optional: `SCR_DDL_GetTableDDL` Script
+## Required: `SCR_DDL_GetTableDDL` Script
 
-The MCP server auto-discovers tables from the OData service document. For richer
-schema (field types, primary keys, field tiers), create a FileMaker script that
-returns SQL DDL.
+The MCP server auto-discovers table **names** from the OData service document,
+but without this script Claude won't know field names, types, or keys —
+making effective queries impossible. Install this script in every FileMaker
+database you connect to the MCP server.
 
 ### What It Does
 

@@ -66,11 +66,23 @@ Add to your Claude Desktop MCP config
 uv run filemaker-mcp
 ```
 
-## Schema Discovery
+## Schema Discovery — Important Setup Step
 
-On startup, the server auto-discovers your tables from the OData service
-document. For richer schema (field types, primary keys, tiers), install the
-optional `GetTableDDL` FileMaker script — see `docs/FM_ACCOUNT_SETUP.md`.
+On startup, the server auto-discovers your table **names** from the OData
+service document. However, for Claude to query effectively it needs field
+names, types, and primary keys — this requires the `SCR_DDL_GetTableDDL`
+FileMaker script.
+
+**Without the DDL script:** Claude can see which tables exist but won't know
+field names or types. Queries will be limited since Claude can't construct
+proper filters or selects without knowing the schema.
+
+**With the DDL script:** Full schema discovery — field names, types, primary
+keys, foreign keys, and field tier classification. This is the intended setup.
+
+See [FM Account Setup](docs/FM_ACCOUNT_SETUP.md) for the script definition
+and installation steps. The script uses `GetTableDDL()` (FileMaker 22+) and
+takes ~5 minutes to create.
 
 ## Analytics
 
