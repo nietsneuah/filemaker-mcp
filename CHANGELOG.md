@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-02-21
+
 ### Added
 - **Release automation** — `scripts/release.sh` handles version bump, CHANGELOG update, tests, commit, tag, push, and GitHub release creation. Supports `patch`, `minor`, `major`, explicit `X.Y.Z`, and `--dry-run`.
 - **Single version source** — hatch dynamic version reads from `src/filemaker_mcp/__init__.py`. Removed static `version` from `pyproject.toml`.
