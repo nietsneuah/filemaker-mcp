@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- **Silent empty table list on connection failure** — `list_tables()` now shows the actual error when bootstrap fails (bad credentials, unreachable host, missing `FM_DATABASE`) instead of silently returning an empty list. Clears stale errors when bootstrap subsequently succeeds. ([#2](https://github.com/nietsneuah/filemaker-mcp/issues/2))
 - **Zero tables discovered when DDL script is missing** — `bootstrap_ddl()` now falls through to OData service document discovery when the `SCR_DDL_GetTableDDL` script is not found on the FM server. Previously, the "script not found" branch returned immediately and relied on static DDL, which is empty in this repo — resulting in zero tables. ([#3](https://github.com/nietsneuah/filemaker-mcp/pull/3))
 - **Settings rejects extra environment variables** — `Settings` (pydantic-settings) now includes `"extra": "ignore"` in `model_config`. Previously, any unrecognized environment variable (e.g., `ANTHROPIC_API_KEY`, `GHL_API_KEY`) caused a `ValidationError` at import time. This was invisible when running as a standalone MCP server (only FM vars present), but broke when imported as a library dependency in projects with their own env vars. ([#1](https://github.com/nietsneuah/filemaker-mcp/pull/1))
 
