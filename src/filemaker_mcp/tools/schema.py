@@ -509,21 +509,36 @@ async def bootstrap_ddl() -> None:
         table_names = discovered
         logger.info("DDL bootstrap step 2: discovered %d tables from FM", len(table_names))
         # Merge discovered tables into EXPOSED_TABLES
-        from filemaker_mcp.tools.query import merge_discovered_tables
+        from filemaker_mcp.tools.query import merge_discovered_tables, set_bootstrap_error
 
         merge_discovered_tables(table_names)
-    else:
-        # Fallback to hardcoded EXPOSED_TABLES
+        set_bootstrap_error(None)  # Clear any stale error from a previous attempt
+    elif discovered is None:
+        # Retry exhaustion — genuine failure
+        from filemaker_mcp.tools.query import set_bootstrap_error
+
         table_names = list(EXPOSED_TABLES.keys())
         logger.warning(
-            "DDL bootstrap step 2: discovery failed, falling back to %d hardcoded tables",
+            "DDL bootstrap step 2: discovery failed after retries, "
+            "falling back to %d hardcoded tables",
             len(table_names),
         )
         if not table_names:
-            from filemaker_mcp.tools.query import set_bootstrap_error
-
             set_bootstrap_error(
-                _last_discovery_error or "OData discovery returned no tables"
+                _last_discovery_error or "OData discovery failed after retries"
+            )
+    else:
+        # Successful response but no tables — permissions issue
+        from filemaker_mcp.tools.query import set_bootstrap_error
+
+        table_names = list(EXPOSED_TABLES.keys())
+        logger.warning(
+            "DDL bootstrap step 2: OData returned no permitted tables for this user"
+        )
+        if not table_names:
+            set_bootstrap_error(
+                _last_discovery_error
+                or "OData returned no tables — check user permissions"
             )
 
     # Step 3: Fetch DDL for all tables via script
