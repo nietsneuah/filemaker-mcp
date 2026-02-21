@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-02-21
+
 ### Fixed
 - **Silent empty table list on connection failure** — `list_tables()` now shows the actual error when bootstrap fails (bad credentials, unreachable host, missing `FM_DATABASE`) instead of silently returning an empty list. Clears stale errors when bootstrap subsequently succeeds. ([#2](https://github.com/nietsneuah/filemaker-mcp/issues/2))
 - **Zero tables discovered when DDL script is missing** — `bootstrap_ddl()` now falls through to OData service document discovery when the `SCR_DDL_GetTableDDL` script is not found on the FM server. Previously, the "script not found" branch returned immediately and relied on static DDL, which is empty in this repo — resulting in zero tables. ([#3](https://github.com/nietsneuah/filemaker-mcp/pull/3))
