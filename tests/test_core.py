@@ -1160,6 +1160,49 @@ class TestListTables:
         assert "invoice" in result.lower()
 
 
+class TestListTablesBootstrapError:
+    """Test list_tables surfaces bootstrap errors when tables are empty."""
+
+    @pytest.mark.asyncio
+    async def test_shows_error_when_bootstrap_failed(self) -> None:
+        from filemaker_mcp.tools.query import (
+            EXPOSED_TABLES,
+            list_tables,
+            set_bootstrap_error,
+        )
+
+        saved = dict(EXPOSED_TABLES)
+        EXPOSED_TABLES.clear()
+        set_bootstrap_error("ConnectionError: Cannot connect to FM Server")
+        try:
+            result = await list_tables()
+            assert "No tables available" in result
+            assert "ConnectionError" in result
+            assert "FM_HOST" in result
+        finally:
+            EXPOSED_TABLES.update(saved)
+            set_bootstrap_error(None)
+
+    @pytest.mark.asyncio
+    async def test_no_error_when_tables_present(self) -> None:
+        from filemaker_mcp.tools.query import (
+            EXPOSED_TABLES,
+            list_tables,
+            set_bootstrap_error,
+        )
+
+        saved = dict(EXPOSED_TABLES)
+        EXPOSED_TABLES["TestTable"] = "Test description"
+        set_bootstrap_error("some old error")
+        try:
+            result = await list_tables()
+            assert "No tables available" not in result
+        finally:
+            EXPOSED_TABLES.clear()
+            EXPOSED_TABLES.update(saved)
+            set_bootstrap_error(None)
+
+
 class TestNormalizeDatesInFilter:
     """Tests for normalize_dates_in_filter() — FM OData date format safety net."""
 
@@ -1429,17 +1472,18 @@ class TestBootstrapDDL:
     """Test 3-step DDL bootstrap: probe script -> discover tables -> fetch DDL."""
 
     @pytest.mark.asyncio
-    async def test_step1_script_not_found_stops_early(self) -> None:
-        """If DDL script doesn't exist (404), bootstrap stops after step 1."""
+    async def test_step1_script_not_found_falls_through_to_discovery(self) -> None:
+        """If DDL script doesn't exist (404), bootstrap falls through to OData discovery."""
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(side_effect=ValueError("not found"))
+        mock_client.get = AsyncMock(return_value={"value": [{"name": "Customers"}]})
 
         with patch("filemaker_mcp.tools.schema.odata_client", mock_client):
             set_script_available(None)
             await bootstrap_ddl()
 
-        # Should NOT have called get (step 2 discovery)
-        mock_client.get.assert_not_called()
+        # Should have called get (step 2 OData discovery)
+        mock_client.get.assert_called()
         assert is_script_available() is False
 
     @pytest.mark.asyncio

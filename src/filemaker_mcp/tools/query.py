@@ -204,6 +204,15 @@ def quote_fields_in_filter(filter_str: str) -> str:
 # Tables are discovered from the FileMaker OData service document.
 EXPOSED_TABLES: dict[str, str] = {}
 
+# Stores error message if bootstrap failed, surfaced by list_tables().
+_bootstrap_error: str | None = None
+
+
+def set_bootstrap_error(error: str | None) -> None:
+    """Store a bootstrap failure message for later surfacing."""
+    global _bootstrap_error
+    _bootstrap_error = error
+
 
 def merge_discovered_tables(table_names: list[str]) -> None:
     """Add FM-discovered tables to EXPOSED_TABLES if not already present.
@@ -460,6 +469,14 @@ async def list_tables() -> str:
     Returns:
         List of table names with descriptions of what each contains.
     """
+    if not EXPOSED_TABLES and _bootstrap_error:
+        return (
+            "No tables available. Connection failed during startup:\n\n"
+            f"  {_bootstrap_error}\n\n"
+            "Check your .env file: FM_HOST, FM_DATABASE, FM_USERNAME, FM_PASSWORD.\n"
+            "If using a self-signed certificate, set FM_VERIFY_SSL=false."
+        )
+
     lines = ["Available FileMaker tables:", ""]
     for table, description in EXPOSED_TABLES.items():
         lines.append(f"  {table}: {description}")

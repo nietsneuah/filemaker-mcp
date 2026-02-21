@@ -67,6 +67,10 @@ async def _retry_with_backoff(
     return None
 
 
+# Captures the last error from _discover_tables_from_odata for user-facing messages.
+_last_discovery_error: str | None = None
+
+
 async def _discover_tables_from_odata() -> list[str]:
     """Discover available table names from the OData service document.
 
@@ -76,11 +80,14 @@ async def _discover_tables_from_odata() -> list[str]:
     Returns:
         List of table names, or empty list on failure.
     """
+    global _last_discovery_error
     try:
         data = await odata_client.get("", params={"$format": "JSON"})
         entries = data.get("value", [])
+        _last_discovery_error = None
         return [entry["name"] for entry in entries if "name" in entry]
-    except Exception:
+    except Exception as e:
+        _last_discovery_error = f"{type(e).__name__}: {e}"
         logger.exception("Failed to discover tables from OData service document")
         return []
 
@@ -479,11 +486,17 @@ async def bootstrap_ddl() -> None:
             # Other ValueError — script exists but errored, continue
             set_script_available(True)
             logger.warning("DDL bootstrap step 1: probe returned error, continuing: %s", e)
-    except PermissionError:
+    except PermissionError as e:
         logger.error("DDL bootstrap step 1: authentication failed, skipping bootstrap")
+        from filemaker_mcp.tools.query import set_bootstrap_error
+
+        set_bootstrap_error(f"PermissionError: {e}")
         return
-    except ConnectionError:
+    except ConnectionError as e:
         logger.warning("DDL bootstrap step 1: FM unreachable, using static DDL")
+        from filemaker_mcp.tools.query import set_bootstrap_error
+
+        set_bootstrap_error(f"ConnectionError: {e}")
         return
 
     # Step 2: Discover tables from OData service document
@@ -506,6 +519,12 @@ async def bootstrap_ddl() -> None:
             "DDL bootstrap step 2: discovery failed, falling back to %d hardcoded tables",
             len(table_names),
         )
+        if not table_names:
+            from filemaker_mcp.tools.query import set_bootstrap_error
+
+            set_bootstrap_error(
+                _last_discovery_error or "OData discovery returned no tables"
+            )
 
     # Step 3: Fetch DDL for all tables via script
     async def _fetch_ddl() -> bool:
