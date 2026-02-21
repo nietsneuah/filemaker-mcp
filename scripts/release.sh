@@ -12,6 +12,8 @@
 
 set -euo pipefail
 
+export PATH="$HOME/.local/bin:$PATH"
+
 INIT_FILE="src/filemaker_mcp/__init__.py"
 CHANGELOG="CHANGELOG.md"
 
@@ -21,7 +23,13 @@ VERSION_ARG=""
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
-        *) VERSION_ARG="$arg" ;;
+        *)
+            if [[ -n "$VERSION_ARG" ]]; then
+                echo "ERROR: Multiple version arguments provided: '$VERSION_ARG' and '$arg'. Use exactly one."
+                exit 1
+            fi
+            VERSION_ARG="$arg"
+            ;;
     esac
 done
 
@@ -34,6 +42,11 @@ fi
 CURRENT=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$INIT_FILE")
 if [[ -z "$CURRENT" ]]; then
     echo "ERROR: Could not read version from $INIT_FILE"
+    exit 1
+fi
+
+if ! [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: Current version '$CURRENT' in $INIT_FILE is not a simple X.Y.Z version."
     exit 1
 fi
 
@@ -57,6 +70,15 @@ esac
 echo "Version: $CURRENT → $NEW_VERSION"
 
 # --- Preflight checks ---
+if ! command -v gh >/dev/null 2>&1; then
+    echo "ERROR: gh CLI not found. Install from https://cli.github.com/"
+    exit 1
+fi
+if ! gh auth status >/dev/null 2>&1; then
+    echo "ERROR: gh CLI not authenticated. Run 'gh auth login'."
+    exit 1
+fi
+
 if [[ "$(git branch --show-current)" != "main" ]]; then
     echo "ERROR: Must be on main branch (currently on $(git branch --show-current))"
     exit 1
@@ -68,13 +90,16 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 # Check CHANGELOG has unreleased content
-UNRELEASED_CONTENT=$(sed -n '/^## \[Unreleased\]/,/^## \[/p' "$CHANGELOG" | sed '1d;$d' | grep -v '^$' || true)
+UNRELEASED_CONTENT=$(sed -n '/^## \[Unreleased\]/,/^## /p' "$CHANGELOG" | sed '1d;$d' | grep -v '^$' || true)
 if [[ -z "$UNRELEASED_CONTENT" ]]; then
     echo "WARNING: No content under [Unreleased] in CHANGELOG.md"
     echo "  The release will have an empty changelog section."
     if [[ "$DRY_RUN" == false ]]; then
         read -rp "Continue anyway? [y/N] " confirm
-        [[ "$confirm" == [yY] ]] || exit 1
+        if [[ "$confirm" != [yY] ]]; then
+            echo "Release cancelled by user."
+            exit 1
+        fi
     fi
 fi
 
@@ -108,7 +133,7 @@ echo "Updated $INIT_FILE"
 # --- Update CHANGELOG ---
 TODAY=$(date +%Y-%m-%d)
 python3 -c "
-import pathlib, re
+import pathlib
 p = pathlib.Path('$CHANGELOG')
 text = p.read_text()
 text = text.replace(
@@ -124,12 +149,11 @@ echo "Updated $CHANGELOG"
 git add "$INIT_FILE" "$CHANGELOG"
 git commit -m "release: v$NEW_VERSION"
 git tag -a "v$NEW_VERSION" -m "v$NEW_VERSION"
-git push origin main --tags
+git push origin main "v$NEW_VERSION"
 echo ""
 
 # --- Create GitHub release ---
-# Extract release notes from CHANGELOG (content between this version and the next)
-RELEASE_NOTES=$(sed -n "/^## \[$NEW_VERSION\]/,/^## \[/p" "$CHANGELOG" | sed '1d;$d')
+RELEASE_NOTES=$(sed -n "/^## \[$NEW_VERSION\]/,/^## /p" "$CHANGELOG" | sed '1d;$d')
 gh release create "v$NEW_VERSION" --title "v$NEW_VERSION" --notes "$RELEASE_NOTES"
 
 echo ""
