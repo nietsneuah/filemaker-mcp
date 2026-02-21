@@ -1,6 +1,6 @@
 [project]
 name = "filemaker-mcp"
-version = "0.1.1"
+dynamic = ["version"]
 description = "MCP server connecting AI assistants to FileMaker databases via OData"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -21,6 +21,9 @@ filemaker-mcp = "filemaker_mcp.server:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/filemaker_mcp/__init__.py"
 
 [tool.ruff]
 target-version = "py312"
