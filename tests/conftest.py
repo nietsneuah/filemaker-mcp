@@ -16,47 +16,39 @@ def _populate_test_tables():
 
     # Sample tables for testing
     test_tables = {
-        "Location": "Customer service locations.",
-        "Customers": "Parent customer entities.",
-        "InHomeInvoiceHeader": "Service invoices and work orders.",
-        "InHomeLineItem": "Invoice line items.",
+        "Customers": "Customer records.",
+        "Invoices": "Service invoices.",
+        "LineItems": "Invoice line items.",
         "Orders": "Orders.",
-        "OrderLine": "Order line items.",
-        "Pickups": "Pickup and delivery schedule.",
-        "Drivers IH": "Service drivers.",
-        "CommissionRates": "Commission rates by service type.",
+        "Drivers": "Service drivers.",
     }
 
     # Sample DDL for testing
     test_ddl = {
-        "Location": {
-            "_kp_CustLoc": {"type": "number", "tier": "key", "pk": True},
-            "Customer Name": {"type": "text", "tier": "key"},
+        "Customers": {
+            "CustomerID": {"type": "number", "tier": "key", "pk": True},
+            "Company Name": {"type": "text", "tier": "key"},
             "City": {"type": "text", "tier": "key"},
             "State": {"type": "text", "tier": "standard"},
             "Phone": {"type": "text", "tier": "key"},
             "Email": {"type": "text", "tier": "standard"},
         },
-        "Customers": {
-            "Customer_id": {"type": "number", "tier": "key", "pk": True},
-            "Company": {"type": "text", "tier": "standard"},
-        },
-        "InHomeInvoiceHeader": {
+        "Invoices": {
             "PrimaryKey": {"type": "text", "tier": "key", "pk": True},
-            "InvoiceTotal": {"type": "number", "tier": "key"},
-            "Date_of_Service": {"type": "datetime", "tier": "key"},
-            "Zone": {"type": "text", "tier": "key"},
-            "Driver": {"type": "text", "tier": "standard"},
+            "Amount": {"type": "number", "tier": "key"},
+            "ServiceDate": {"type": "datetime", "tier": "key"},
+            "Region": {"type": "text", "tier": "key"},
+            "Technician": {"type": "text", "tier": "standard"},
             "City": {"type": "text", "tier": "key"},
             "Name": {"type": "text", "tier": "key"},
         },
-        "InHomeLineItem": {
+        "LineItems": {
             "PrimaryKey": {"type": "text", "tier": "key", "pk": True},
         },
         "Orders": {
             "PrimaryKey": {"type": "text", "tier": "key", "pk": True},
         },
-        "Drivers IH": {
+        "Drivers": {
             "Driver_ID": {"type": "number", "tier": "key", "pk": True},
             "Driver_Name": {"type": "text", "tier": "key"},
         },

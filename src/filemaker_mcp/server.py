@@ -6,6 +6,7 @@ Run via: uv run filemaker-mcp
 
 import datetime
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastmcp import FastMCP
@@ -13,10 +14,23 @@ from fastmcp import FastMCP
 from filemaker_mcp.auth import odata_client
 from filemaker_mcp.config import settings
 from filemaker_mcp.tools.analytics import analyze as analytics_analyze
+from filemaker_mcp.tools.analytics import flush_datasets as analytics_flush_datasets
 from filemaker_mcp.tools.analytics import list_datasets as analytics_list_datasets
 from filemaker_mcp.tools.analytics import load_dataset as analytics_load_dataset
+from filemaker_mcp.tools.context import delete_context as context_delete_context
+from filemaker_mcp.tools.context import save_context as context_save_context
 from filemaker_mcp.tools.query import count_records, get_record, list_tables, query_records
 from filemaker_mcp.tools.schema import bootstrap_ddl, get_schema
+from filemaker_mcp.tools.tenant import (
+    get_active_tenant,
+    init_tenants,
+)
+from filemaker_mcp.tools.tenant import (
+    list_tenants as tenant_list_tenants,
+)
+from filemaker_mcp.tools.tenant import (
+    use_tenant as tenant_use_tenant,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -27,9 +41,18 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(app: FastMCP):
-    """Server lifecycle: bootstrap DDL on startup, close client on shutdown."""
-    await bootstrap_ddl()
+async def lifespan(app: FastMCP) -> AsyncIterator[None]:
+    """Server lifecycle: load tenants, bootstrap default, close client on shutdown."""
+    from filemaker_mcp.auth import reset_client
+
+    default_name = init_tenants()
+    tenant = get_active_tenant()
+    if tenant:
+        await reset_client(tenant)
+        await bootstrap_ddl()
+        logger.info("Connected to default tenant '%s' (%s)", default_name, tenant.host)
+    else:
+        logger.warning("No tenants configured — server starting without FM connection")
     try:
         yield
     finally:
@@ -81,34 +104,24 @@ async def fm_query_records(
 ) -> str:
     """Query FileMaker records from a FileMaker table using OData v4.
 
-    Use this tool to search, filter, and retrieve records from the FileMaker ERP system.
-    This is the primary tool for answering questions about customers, invoices,
-    orders, drivers, and service history.
+    Use this tool to search, filter, and retrieve records from your
+    FileMaker database.
 
     Args:
-        table: Table name. Available tables:
-            - Location: Customer service locations (primary customer record)
-            - Customers: Parent customer entities
-            - InHomeInvoiceHeader: In-home service invoices/work orders
-            - InHomeLineItem: Invoice line items (rooms, furniture, services)
-            - Orders: Orders
-            - OrderLine: Order line items
-            - Pickups: Pickup/delivery schedule and routing
-            - Drivers IH: In-home service drivers
-            - CommissionRates: Driver commission rates by service type
+        table: Table name (use fm_list_tables to see available tables).
         filter: OData $filter expression.
             ALWAYS call fm_get_schema(table) first — field names vary by table.
             Examples (use exact names from get_schema):
-            - "City eq ''"
-            - "Date_of_Service ge 2026-01-01"
-            - "InvoiceTotal gt 500"
-            - "Zone eq 'A' and Status eq 'Open'"
+            - "City eq 'Springfield'"
+            - "ServiceDate ge 2026-01-01"
+            - "Amount gt 500"
+            - "Region eq 'A' and Status eq 'Open'"
         select: Comma-separated field names to return. Leave empty for all fields.
-            Example: "Customer Name,Phone,City,Email"
+            Example: "Company Name,Phone,City,Email"
         top: Maximum records to return (default 20, max 10000).
         skip: Number of records to skip (for pagination).
         orderby: OData $orderby expression.
-            Example: "Date_of_Service desc" or "Customer Name asc"
+            Example: "ServiceDate desc" or "Company Name asc"
         count: Include total record count in response (default True).
 
     Returns:
@@ -132,12 +145,9 @@ async def fm_get_record(table: str, record_id: str, id_field: str = "") -> str:
     Use this when you know the specific record ID and want full details.
 
     Args:
-        table: Table name (see fm_query_records for available tables).
+        table: Table name (use fm_list_tables for available tables).
         record_id: The primary key value to look up.
-        id_field: The primary key field name. Defaults per table:
-            - Location: "_kp_CustLoc"
-            - Customers: "Customer_id"
-            - InHomeInvoiceHeader: "PrimaryKey"
+        id_field: The primary key field name (use fm_get_schema to find PKs).
 
     Returns:
         Formatted text with all fields for the matching record.
@@ -191,7 +201,7 @@ async def fm_get_schema(table: str = "", refresh: bool = False, show_all: bool =
     from FileMaker.
 
     Args:
-        table: Table name to get fields for (e.g., "Location", "Orders").
+        table: Table name to get fields for (e.g., "Customers", "Orders").
             Leave empty to list all available tables.
             You can request any table that exists in FileMaker — not just
             the standard list. Unknown tables are auto-discovered.
@@ -230,10 +240,10 @@ async def fm_load_dataset(
         name: Your chosen identifier for this dataset (e.g., "inv25", "customers").
         table: FM table to query (see fm_list_tables for available tables).
         filter: OData $filter expression. Use exact field names from get_schema.
-            Example: "Date_of_Service ge 2025-01-01 and Date_of_Service lt 2026-01-01"
+            Example: "ServiceDate ge 2025-01-01 and ServiceDate lt 2026-01-01"
         select: Comma-separated fields to fetch. Leave empty for all fields.
             TIP: Select only the fields you need — reduces memory and speeds loading.
-            Example: "Driver,Zone,InvoiceTotal,Date_of_Service"
+            Example: "Technician,Region,Amount,ServiceDate"
 
     Returns:
         Summary with row count, columns, and memory usage.
@@ -249,10 +259,13 @@ async def fm_analyze(
     filter: str = "",
     sort: str = "",
     limit: int = 50,
+    period: str = "",
+    pivot_column: str = "",
 ) -> str:
     """Analyze a loaded dataset with groupby/aggregation. No FM round trip.
 
-    Runs pandas aggregation on a previously loaded dataset. Returns compact
+    Runs pandas aggregation on a previously loaded dataset OR a table from
+    the auto-populated table cache (from query_records). Returns compact
     summary tables instead of raw records — ~200 tokens vs ~400K tokens.
 
     Behavior by parameter combination:
@@ -260,20 +273,29 @@ async def fm_analyze(
     - aggregate only: Scalar aggregation across all rows
     - groupby only: Group counts (value_counts)
     - neither: Summary statistics (describe)
+    - period: Time-series resampling (week/month/quarter)
+    - pivot_column: Cross-tabulation pivot table
 
-    Supported aggregate functions: sum, count, mean, min, max
+    Supported aggregate functions: sum, count, mean, min, max, median, nunique, std
 
     Args:
-        dataset: Name of a previously loaded dataset (from fm_load_dataset).
+        dataset: Name of a previously loaded dataset (from fm_load_dataset),
+            or a table name from the auto-populated table cache.
         groupby: Comma-separated field names to group by.
-            Example: "Driver,Zone"
+            Example: "Technician,Region"
         aggregate: Comma-separated function:field pairs.
-            Example: "sum:InvoiceTotal,count:InvoiceTotal,mean:InvoiceTotal"
+            Example: "sum:Amount,count:Amount,mean:Amount"
         filter: Pandas query expression to narrow data before aggregating.
-            Example: "Zone == 'A'" or "InvoiceTotal > 500"
+            Example: "Region == 'A'" or "Amount > 500"
         sort: Sort result by column name with optional direction.
-            Example: "InvoiceTotal_sum desc"
+            Example: "Amount_sum desc"
         limit: Maximum rows in output (default 50).
+        period: Time-series resampling — "week", "month", or "quarter".
+            First groupby field must be a datetime column.
+            Example: groupby="ServiceDate", period="month"
+        pivot_column: Cross-tabulate by this column (pivot table).
+            Requires groupby for row index and aggregate for values.
+            Example: groupby="Technician", pivot_column="Region", aggregate="sum:Amount"
 
     Returns:
         Formatted summary table with aggregation results.
@@ -285,6 +307,8 @@ async def fm_analyze(
         filter=filter,
         sort=sort,
         limit=limit,
+        period=period,
+        pivot_column=pivot_column,
     )
 
 
@@ -299,6 +323,122 @@ async def fm_list_datasets() -> str:
         Formatted list of loaded datasets, or message if none loaded.
     """
     return await analytics_list_datasets()
+
+
+@mcp.tool()
+async def fm_flush_datasets(table: str = "") -> str:
+    """Flush cached table data from session memory.
+
+    The MCP server auto-caches query results per table for fast repeat access.
+    Use this to force a fresh fetch from FileMaker — for example, after data
+    has been modified, or to free memory.
+
+    Args:
+        table: Specific table to flush (e.g., "Invoices").
+            Leave empty to flush ALL cached tables.
+
+    Returns:
+        Confirmation with number of rows/tables flushed.
+    """
+    return await analytics_flush_datasets(table=table)
+
+
+@mcp.tool()
+async def fm_use_tenant(name: str) -> str:
+    """Switch to a different FileMaker tenant.
+
+    Connects to the named tenant's FM server and discovers
+    its schema. First switch triggers full bootstrap (may take
+    a few seconds). All subsequent queries go to this tenant.
+
+    Args:
+        name: Tenant name as configured (e.g., "production", "staging").
+            Case-insensitive. Use fm_list_tenants() to see available names.
+
+    Returns:
+        Connection summary with host, database, and table count.
+    """
+    return await tenant_use_tenant(name=name)
+
+
+@mcp.tool()
+async def fm_list_tenants() -> str:
+    """List all configured FileMaker tenants and show which is active.
+
+    Shows tenant names, hosts, and databases. Use fm_use_tenant()
+    to switch to a different tenant.
+
+    Returns:
+        Formatted list of tenants with the active one marked.
+    """
+    return tenant_list_tenants()
+
+
+@mcp.tool()
+async def fm_save_context(
+    table_name: str,
+    context: str,
+    field_name: str = "",
+    context_type: str = "field_values",
+    source: str = "auto",
+) -> str:
+    """Save an operational learning about a FileMaker field or table.
+
+    Call this when you discover useful information during queries:
+    - Field value mappings (e.g., Commercial field uses "1" not "Yes")
+    - OData syntax rules (e.g., "ne" operator not supported)
+    - Query patterns (e.g., how to join two tables)
+    - Relationships (e.g., FK between Invoices and Customers)
+
+    The learning is saved to FM and loaded automatically at next startup,
+    so future sessions benefit immediately.
+
+    Args:
+        table_name: Table this applies to (e.g., "Invoices").
+        context: What you learned (e.g., "Boolean: 1=yes, empty/0=no").
+        field_name: Specific field name, or empty for table-level context.
+        context_type: Category — "field_values", "syntax_rule", "query_pattern", "relationship".
+        source: How this was discovered — "auto", "auto:filter_discovery", "manual".
+
+    Returns:
+        Confirmation message or error description.
+    """
+    return await context_save_context(
+        table_name=table_name,
+        context=context,
+        field_name=field_name,
+        context_type=context_type,
+        source=source,
+    )
+
+
+@mcp.tool()
+async def fm_delete_context(
+    table_name: str,
+    field_name: str = "",
+    context_type: str = "field_values",
+) -> str:
+    """Delete an operational learning about a FileMaker field or table.
+
+    Call this to remove stale or incorrect context entries — for example,
+    when a table or field has been renamed/deleted, or when a previously
+    saved hint is no longer accurate.
+
+    The record is deleted from FM and removed from the local cache immediately.
+
+    Args:
+        table_name: Table this applies to (e.g., "Invoices").
+        field_name: Specific field name, or empty for table-level context.
+        context_type: Category — "field_values", "syntax_rule", "query_pattern", "relationship".
+
+    Returns:
+        Confirmation message or error description.
+    """
+    return await context_delete_context(
+        table_name=table_name,
+        field_name=field_name,
+        context_type=context_type,
+    )
 
 
 def main() -> None:
