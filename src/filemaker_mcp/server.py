@@ -389,15 +389,23 @@ async def fm_save_context(
     - OData syntax rules (e.g., "ne" operator not supported)
     - Query patterns (e.g., how to join two tables)
     - Relationships (e.g., FK between Invoices and Customers)
+    - Value normalization maps (e.g., "Jake" and "Jacob Owens" are the same person)
 
     The learning is saved to FM and loaded automatically at next startup,
     so future sessions benefit immediately.
 
     Args:
         table_name: Table this applies to (e.g., "Invoices").
-        context: What you learned (e.g., "Boolean: 1=yes, empty/0=no").
+        context: What you learned. For most types, free text
+            (e.g., "Boolean: 1=yes, empty/0=no"). For "value_map" type,
+            MUST be a JSON object mapping variant values to their canonical
+            form, e.g. '{"Jake": "Jacob Owens", "Bob": "Robert Smith"}'.
         field_name: Specific field name, or empty for table-level context.
-        context_type: Category — "field_values", "syntax_rule", "query_pattern", "relationship".
+        context_type: Category — "field_values", "syntax_rule",
+            "query_pattern", "relationship", or "value_map". Use "value_map"
+            when the user identifies that two field values represent the same
+            entity (e.g., nicknames, abbreviations, data entry variants).
+            Value maps are applied automatically during fm_analyze groupby.
         source: How this was discovered — "auto", "auto:filter_discovery", "manual".
 
     Returns:

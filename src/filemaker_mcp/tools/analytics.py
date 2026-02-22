@@ -9,6 +9,7 @@ DataFrame per table, keyed by date range. Subsequent queries for the same
 table serve from cache if the date range is covered.
 """
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -16,7 +17,7 @@ from datetime import date, datetime, timedelta
 import pandas as pd  # type: ignore[import-untyped]
 
 from filemaker_mcp.auth import odata_client
-from filemaker_mcp.ddl import TABLES
+from filemaker_mcp.ddl import TABLES, get_context_value
 from filemaker_mcp.tools.query import (
     EXPOSED_TABLES,
     normalize_dates_in_filter,
@@ -334,6 +335,84 @@ async def load_dataset(
 _SUPPORTED_AGGS = {"sum", "count", "mean", "min", "max", "median", "nunique", "std"}
 
 
+def _parse_value_maps(context_str: str | None) -> dict[str, str]:
+    """Parse a value_map context string (JSON dict) into a replacement dict.
+
+    Returns empty dict on None, empty string, or invalid JSON.
+    """
+    if not context_str:
+        return {}
+    try:
+        parsed = json.loads(context_str)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(k): str(v) for k, v in parsed.items()}
+
+
+def _apply_normalization(
+    df: pd.DataFrame, field_mappings: dict[str, dict[str, str]]
+) -> tuple[pd.DataFrame, list[str]]:
+    """Apply value mappings to DataFrame columns, returning a copy.
+
+    Args:
+        df: Source DataFrame (not mutated).
+        field_mappings: {field_name: {old_value: new_value, ...}, ...}
+
+    Returns:
+        Tuple of (normalized DataFrame copy, list of inline note strings).
+        Notes are empty if no values were actually changed.
+    """
+    if not field_mappings:
+        return df, []
+
+    df = df.copy()
+    notes: list[str] = []
+
+    for field, mapping in field_mappings.items():
+        if field not in df.columns:
+            continue
+        before = df[field].copy()
+        df[field] = df[field].replace(mapping)
+        changed_counts: list[str] = []
+        for old_val, new_val in mapping.items():
+            count = int((before == old_val).sum())
+            if count > 0:
+                changed_counts.append(f"{old_val}\u2192{new_val}: {count}")
+        if changed_counts:
+            notes.append(f"{field} ({', '.join(changed_counts)})")
+
+    return df, notes
+
+
+def _collect_value_maps(table: str, fields: list[str]) -> dict[str, dict[str, str]]:
+    """Collect value_map DDL Context entries for the given fields.
+
+    Args:
+        table: FM table name.
+        fields: List of field names to check for value_map entries.
+
+    Returns:
+        Dict of {field: {old_val: new_val}} for fields that have mappings.
+        Fields with no mapping or malformed JSON are silently skipped.
+    """
+    mappings: dict[str, dict[str, str]] = {}
+    for field in fields:
+        raw = get_context_value(table, "value_map", field)
+        parsed = _parse_value_maps(raw)
+        if parsed:
+            mappings[field] = parsed
+    return mappings
+
+
+def _format_norm_note(notes: list[str]) -> str:
+    """Format normalization notes as an inline appendix."""
+    if not notes:
+        return ""
+    return f"\nNormalized: {', '.join(notes)}"
+
+
 def _parse_aggregates(
     aggregate_str: str, available_columns: list[str]
 ) -> dict[str, list[str]] | str:
@@ -421,6 +500,17 @@ async def analyze(
         except Exception as e:
             return f"Filter error: {e}"
 
+    # --- Collect and apply value_map normalization ---
+    norm_notes: list[str] = []
+    if groupby:
+        groupby_fields_for_norm = [f.strip() for f in groupby.split(",") if f.strip()]
+        norm_fields = list(groupby_fields_for_norm)
+        if pivot_column:
+            norm_fields.append(pivot_column)
+        field_mappings = _collect_value_maps(entry.table, norm_fields)
+        if field_mappings:
+            df, norm_notes = _apply_normalization(df, field_mappings)
+
     if not groupby and not aggregate:
         # describe() -- summary statistics
         result_df = df.describe(include="all")
@@ -478,7 +568,7 @@ async def analyze(
         return (
             f"Time-series analysis of '{dataset}' ({len(df)} records, {period}ly):\n\n"
             f"{result_str}\n\n"
-            f"({total_groups} periods)"
+            f"({total_groups} periods)" + _format_norm_note(norm_notes)
         )
 
     # --- Pivot mode ---
@@ -519,7 +609,7 @@ async def analyze(
             f"Rows: {', '.join(groupby_fields)} | Columns: {pivot_column} "
             f"| Values: {agg_func}({agg_field})\n\n"
             f"{result_str}\n\n"
-            f"({total_groups} rows)"
+            f"({total_groups} rows)" + _format_norm_note(norm_notes)
         )
 
     # --- Standard groupby/aggregate ---
@@ -535,7 +625,7 @@ async def analyze(
         return (
             f"Group counts for '{dataset}' ({len(df)} records):\n\n"
             f"{result_str}\n\n"
-            f"({len(counts)} groups)"
+            f"({len(counts)} groups)" + _format_norm_note(norm_notes)
         )
 
     # Parse aggregate spec
@@ -580,4 +670,5 @@ async def analyze(
         f"Analysis of '{dataset}' ({len(df)} records aggregated):\n\n"
         f"{result_str}\n\n"
         f"({total_groups} groups shown, {len(entry.df)} total records in dataset)"
+        + _format_norm_note(norm_notes)
     )

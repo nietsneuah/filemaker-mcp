@@ -178,7 +178,9 @@ def get_context_value(table: str, context_type: str, field: str = "") -> str | N
 
     Args:
         table: FM table name.
-        context_type: Context category (e.g., "report_select", "cache_config").
+        context_type: Context category (e.g., "cache_config", "field_values",
+            "value_map"). value_map entries are JSON dicts {"old": "new"} used
+            by fm_analyze to normalize values during groupby/pivot.
         field: Field name. Empty string for table-level context.
 
     Returns:

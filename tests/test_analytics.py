@@ -1,5 +1,6 @@
 """Tests for the analytics tools (load, analyze, list datasets)."""
 
+from collections.abc import Generator
 from datetime import date, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -989,3 +990,254 @@ class TestAnalyzeTableCacheFallback:
         )
         result = await analyze(dataset="inv", aggregate="sum:Amount")
         assert "100" in result
+
+
+class TestValueMapParsing:
+    """Tests for _parse_value_maps helper."""
+
+    def test_valid_json_dict(self) -> None:
+        from filemaker_mcp.tools.analytics import _parse_value_maps
+
+        result = _parse_value_maps('{"Jake": "Jacob Owens", "Bob": "Robert Smith"}')
+        assert result == {"Jake": "Jacob Owens", "Bob": "Robert Smith"}
+
+    def test_empty_string(self) -> None:
+        from filemaker_mcp.tools.analytics import _parse_value_maps
+
+        assert _parse_value_maps("") == {}
+
+    def test_none_input(self) -> None:
+        from filemaker_mcp.tools.analytics import _parse_value_maps
+
+        assert _parse_value_maps(None) == {}
+
+    def test_malformed_json(self) -> None:
+        from filemaker_mcp.tools.analytics import _parse_value_maps
+
+        assert _parse_value_maps("not json") == {}
+
+    def test_json_array_rejected(self) -> None:
+        from filemaker_mcp.tools.analytics import _parse_value_maps
+
+        assert _parse_value_maps("[1, 2, 3]") == {}
+
+    def test_json_non_string_values_coerced(self) -> None:
+        from filemaker_mcp.tools.analytics import _parse_value_maps
+
+        result = _parse_value_maps('{"1": "Active", "2": "Inactive"}')
+        assert result == {"1": "Active", "2": "Inactive"}
+
+
+class TestApplyNormalization:
+    """Tests for _apply_normalization helper."""
+
+    def test_single_field_mapping(self) -> None:
+        from filemaker_mcp.tools.analytics import _apply_normalization
+
+        df = pd.DataFrame({"Driver": ["Jake", "Jacob Owens", "Jake", "Mike"]})
+        mapping = {"Driver": {"Jake": "Jacob Owens"}}
+        result_df, notes = _apply_normalization(df, mapping)
+        assert list(result_df["Driver"]) == ["Jacob Owens", "Jacob Owens", "Jacob Owens", "Mike"]
+        assert "Jake" in notes[0]
+        assert "Jacob Owens" in notes[0]
+        assert "2" in notes[0]  # 2 rows changed
+
+    def test_multiple_field_mappings(self) -> None:
+        from filemaker_mcp.tools.analytics import _apply_normalization
+
+        df = pd.DataFrame(
+            {
+                "Driver": ["Jake", "Jacob Owens"],
+                "Zone": ["CIN", "DAY"],
+            }
+        )
+        mapping = {
+            "Driver": {"Jake": "Jacob Owens"},
+            "Zone": {"CIN": "", "DAY": ""},
+        }
+        result_df, notes = _apply_normalization(df, mapping)
+        assert list(result_df["Driver"]) == ["Jacob Owens", "Jacob Owens"]
+        assert list(result_df["Zone"]) == ["", ""]
+        assert len(notes) == 2
+
+    def test_no_mappings(self) -> None:
+        from filemaker_mcp.tools.analytics import _apply_normalization
+
+        df = pd.DataFrame({"Driver": ["Jake", "Mike"]})
+        result_df, notes = _apply_normalization(df, {})
+        assert list(result_df["Driver"]) == ["Jake", "Mike"]
+        assert notes == []
+
+    def test_mapping_source_not_in_data(self) -> None:
+        from filemaker_mcp.tools.analytics import _apply_normalization
+
+        df = pd.DataFrame({"Driver": ["Mike", "Sam"]})
+        mapping = {"Driver": {"Jake": "Jacob Owens"}}
+        result_df, notes = _apply_normalization(df, mapping)
+        assert list(result_df["Driver"]) == ["Mike", "Sam"]
+        assert notes == []  # No changes, no note
+
+    def test_original_df_unchanged(self) -> None:
+        from filemaker_mcp.tools.analytics import _apply_normalization
+
+        df = pd.DataFrame({"Driver": ["Jake", "Mike"]})
+        mapping = {"Driver": {"Jake": "Jacob Owens"}}
+        _apply_normalization(df, mapping)
+        assert list(df["Driver"]) == ["Jake", "Mike"]  # Original untouched
+
+
+class TestCollectValueMaps:
+    """Tests for _collect_value_maps — reads DDL Context for value_map entries."""
+
+    def test_finds_mapping_for_groupby_field(self) -> None:
+        from filemaker_mcp.ddl import DDL_CONTEXT
+        from filemaker_mcp.tools.analytics import _collect_value_maps
+
+        DDL_CONTEXT.clear()
+        DDL_CONTEXT[("Invoices", "Technician", "value_map")] = {
+            "context": '{"Jake": "Jacob Owens"}'
+        }
+        result = _collect_value_maps("Invoices", ["Technician"])
+        assert result == {"Technician": {"Jake": "Jacob Owens"}}
+        DDL_CONTEXT.clear()
+
+    def test_no_mapping_for_field(self) -> None:
+        from filemaker_mcp.ddl import DDL_CONTEXT
+        from filemaker_mcp.tools.analytics import _collect_value_maps
+
+        DDL_CONTEXT.clear()
+        result = _collect_value_maps("Invoices", ["Technician"])
+        assert result == {}
+        DDL_CONTEXT.clear()
+
+    def test_malformed_json_skipped_with_warning(self) -> None:
+        from filemaker_mcp.ddl import DDL_CONTEXT
+        from filemaker_mcp.tools.analytics import _collect_value_maps
+
+        DDL_CONTEXT.clear()
+        DDL_CONTEXT[("Invoices", "Technician", "value_map")] = {"context": "not json"}
+        result = _collect_value_maps("Invoices", ["Technician"])
+        assert result == {}
+        DDL_CONTEXT.clear()
+
+    def test_multiple_fields(self) -> None:
+        from filemaker_mcp.ddl import DDL_CONTEXT
+        from filemaker_mcp.tools.analytics import _collect_value_maps
+
+        DDL_CONTEXT.clear()
+        DDL_CONTEXT[("Invoices", "Technician", "value_map")] = {
+            "context": '{"Jake": "Jacob Owens"}'
+        }
+        DDL_CONTEXT[("Invoices", "Region", "value_map")] = {"context": '{"CIN": ""}'}
+        result = _collect_value_maps("Invoices", ["Technician", "Region"])
+        assert result == {
+            "Technician": {"Jake": "Jacob Owens"},
+            "Region": {"CIN": ""},
+        }
+        DDL_CONTEXT.clear()
+
+    def test_empty_fields_list(self) -> None:
+        from filemaker_mcp.tools.analytics import _collect_value_maps
+
+        assert _collect_value_maps("Invoices", []) == {}
+
+
+class TestAnalyzeNormalization:
+    """Tests for normalization integration in analyze()."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_dataset(self) -> Generator[None, None, None]:
+        """Load a test dataset with values that need normalization."""
+        from filemaker_mcp.ddl import DDL_CONTEXT
+        from filemaker_mcp.tools.analytics import DatasetEntry, _datasets
+
+        df = pd.DataFrame(
+            {
+                "Technician": ["Jake", "Jake", "Jacob Owens", "Mike"],
+                "Region": ["CIN", "CIN", "DAY", "DAY"],
+                "Amount": [100.0, 200.0, 150.0, 300.0],
+            }
+        )
+        _datasets["test_norm"] = DatasetEntry(
+            df=df,
+            table="Invoices",
+            filter="",
+            select="",
+            loaded_at=datetime.now(),
+            row_count=4,
+        )
+        DDL_CONTEXT[("Invoices", "Technician", "value_map")] = {
+            "context": '{"Jake": "Jacob Owens"}'
+        }
+        DDL_CONTEXT[("Invoices", "Region", "value_map")] = {
+            "context": '{"CIN": "", "DAY": ""}'
+        }
+        yield
+        _datasets.pop("test_norm", None)
+        DDL_CONTEXT.clear()
+
+    @pytest.mark.asyncio
+    async def test_groupby_normalizes(self) -> None:
+        from filemaker_mcp.tools.analytics import analyze
+
+        result = await analyze("test_norm", groupby="Technician", aggregate="sum:Amount")
+        # Jake (100+200) merged with Jacob Owens (150) = 450
+        assert "Jacob Owens" in result
+        assert "Jake" not in result.split("Normalized")[0]  # Jake gone from data
+        assert "450" in result
+
+    @pytest.mark.asyncio
+    async def test_normalization_note_appended(self) -> None:
+        from filemaker_mcp.tools.analytics import analyze
+
+        result = await analyze("test_norm", groupby="Technician", aggregate="sum:Amount")
+        assert "Normalized:" in result
+        assert "Jake" in result  # In the note
+        assert "Jacob Owens" in result
+
+    @pytest.mark.asyncio
+    async def test_groupby_value_counts_normalizes(self) -> None:
+        from filemaker_mcp.tools.analytics import analyze
+
+        result = await analyze("test_norm", groupby="Technician")
+        assert "Jacob Owens" in result
+        assert "3" in result  # Jake(2) + Jacob Owens(1) = 3
+
+    @pytest.mark.asyncio
+    async def test_pivot_normalizes(self) -> None:
+        from filemaker_mcp.tools.analytics import analyze
+
+        result = await analyze(
+            "test_norm",
+            groupby="Region",
+            pivot_column="Technician",
+            aggregate="sum:Amount",
+        )
+        assert "Jacob Owens" in result
+        assert "" in result
+        assert "" in result
+
+    @pytest.mark.asyncio
+    async def test_no_mapping_unchanged(self) -> None:
+        from filemaker_mcp.ddl import DDL_CONTEXT
+        from filemaker_mcp.tools.analytics import analyze
+
+        DDL_CONTEXT.clear()  # Remove all mappings
+        result = await analyze("test_norm", groupby="Technician", aggregate="sum:Amount")
+        assert "Jake" in result  # Raw value preserved
+        assert "Normalized:" not in result
+
+    @pytest.mark.asyncio
+    async def test_original_dataset_untouched(self) -> None:
+        from filemaker_mcp.tools.analytics import _datasets, analyze
+
+        await analyze("test_norm", groupby="Technician", aggregate="sum:Amount")
+        original = _datasets["test_norm"].df
+        assert "Jake" in original["Technician"].values  # Still has raw value
+
+    @pytest.mark.asyncio
+    async def test_scalar_aggregate_no_normalization(self) -> None:
+        from filemaker_mcp.tools.analytics import analyze
+
+        result = await analyze("test_norm", aggregate="sum:Amount")
+        assert "Normalized:" not in result  # No groupby, no normalization
