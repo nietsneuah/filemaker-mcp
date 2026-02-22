@@ -14,7 +14,20 @@ from typing import Any
 import httpx
 
 from filemaker_mcp.auth import odata_client
-from filemaker_mcp.ddl import TABLES, is_script_available, set_script_available, update_tables
+from filemaker_mcp.ddl import (
+    CONTEXT_TABLE,
+    FIELD_ANNOTATIONS,
+    TABLES,
+    FieldAnnotations,
+    FieldDef,
+    get_field_context,
+    get_table_context,
+    is_script_available,
+    set_script_available,
+    update_annotations,
+    update_context,
+    update_tables,
+)
 from filemaker_mcp.ddl_parser import parse_ddl
 from filemaker_mcp.tools.query import EXPOSED_TABLES
 
@@ -98,6 +111,14 @@ _schema_cache: dict[str, dict[str, str]] = {}
 # Full $metadata XML cache (only populated when refresh=True)
 _metadata_cache: str | None = None
 
+
+def clear_schema_cache() -> None:
+    """Clear cached schema data for tenant switching."""
+    global _metadata_cache
+    _schema_cache.clear()
+    _metadata_cache = None
+
+
 # Patterns for date/datetime detection in string values
 _DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -129,7 +150,7 @@ def _infer_field_type(value: Any) -> str:
     return "unknown"
 
 
-def _format_ddl_schema(table: str, fields: dict, show_all: bool = False) -> str:
+def _format_ddl_schema(table: str, fields: dict[str, FieldDef], show_all: bool = False) -> str:
     """Format DDL fields into readable schema text.
 
     Args:
@@ -152,6 +173,14 @@ def _format_ddl_schema(table: str, fields: dict, show_all: bool = False) -> str:
     lines.append(header)
     lines.append("-" * len(header))
 
+    # Table-level context hints (syntax rules, query patterns)
+    table_ctx = get_table_context(table)
+    table_level = [c for c in table_ctx if not c.get("field")]
+    if table_level:
+        for ctx in table_level:
+            lines.append(f"  Note: {ctx['context']}")
+        lines.append("")
+
     for field_name, field_def in fields.items():
         tier = field_def.get("tier", "standard")
 
@@ -173,7 +202,12 @@ def _format_ddl_schema(table: str, fields: dict, show_all: bool = False) -> str:
         date_hint = (
             "  (filter as: YYYY-MM-DD, no quotes)" if field_type in ("datetime", "date") else ""
         )
-        lines.append(f"  {field_name}: {field_type}{marker_str}{date_hint}")
+
+        # Context hint for this field
+        ctx_hint = get_field_context(table, field_name)
+        ctx_str = f"  -- {ctx_hint}" if ctx_hint else ""
+
+        lines.append(f"  {field_name}: {field_type}{marker_str}{date_hint}{ctx_str}")
 
     lines.append("")
     lines.append(f"{total} fields total")
@@ -251,6 +285,98 @@ async def _infer_table_schema(table: str) -> dict[str, str]:
         field_types[key] = _infer_field_type(value)
 
     return field_types
+
+
+# Annotation Term suffixes we care about (matched case-insensitively against Term attr)
+_ANNOTATION_MAP = {
+    "calculation": "calculation",
+    "summary": "summary",
+    "global": "global_",
+    "fmcomment": "comment",
+}
+
+
+def _extract_field_annotations(xml_text: str) -> dict[str, dict[str, FieldAnnotations]]:
+    """Extract field-level annotations from OData $metadata XML.
+
+    Parses Calculation, Summary, Global, and FMComment annotations
+    from each EntityType/Property element.
+
+    Args:
+        xml_text: Raw XML from the $metadata endpoint.
+
+    Returns:
+        Nested dict: {table_name: {field_name: FieldAnnotations}}.
+        Only fields with at least one annotation are included.
+    """
+    if not xml_text.strip():
+        return {}
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        logger.warning("Failed to parse $metadata XML for annotations")
+        return {}
+
+    namespaces = {
+        "edmx": "http://docs.oasis-open.org/odata/ns/edmx",
+        "edm": "http://docs.oasis-open.org/odata/ns/edm",
+    }
+
+    result: dict[str, dict[str, FieldAnnotations]] = {}
+
+    entity_types = root.findall(".//edm:EntityType", namespaces)
+    if not entity_types:
+        entity_types = root.findall(".//{http://docs.oasis-open.org/odata/ns/edm}EntityType")
+
+    for entity in entity_types:
+        table_name = entity.get("Name", "")
+        if not table_name:
+            continue
+        # FM appends trailing underscore to EntityType names (e.g. "Orders_")
+        # but DDL uses bare names ("Orders"). Strip to match.
+        table_name = table_name.rstrip("_")
+
+        table_annotations: dict[str, FieldAnnotations] = {}
+
+        properties = entity.findall("edm:Property", namespaces)
+        if not properties:
+            properties = entity.findall("{http://docs.oasis-open.org/odata/ns/edm}Property")
+
+        for prop in properties:
+            field_name = prop.get("Name", "")
+            if not field_name:
+                continue
+
+            annotations = prop.findall("edm:Annotation", namespaces)
+            if not annotations:
+                annotations = prop.findall("{http://docs.oasis-open.org/odata/ns/edm}Annotation")
+
+            if not annotations:
+                continue
+
+            field_ann: FieldAnnotations = {}
+            for ann in annotations:
+                term = (ann.get("Term", "") or "").lower()
+                for suffix, key in _ANNOTATION_MAP.items():
+                    if term.endswith(suffix):
+                        if key == "comment":
+                            value = ann.get("String", "")
+                            if value:
+                                field_ann[key] = value  # type: ignore[literal-required]
+                        else:
+                            bool_val = ann.get("Bool", "").lower() == "true"
+                            if bool_val:
+                                field_ann[key] = True  # type: ignore[literal-required]
+                        break
+
+            if field_ann:
+                table_annotations[field_name] = field_ann
+
+        if table_annotations:
+            result[table_name] = table_annotations
+
+    return result
 
 
 async def _get_schema_from_metadata(table_filter: str = "") -> str:
@@ -384,8 +510,74 @@ def _parse_metadata_xml(xml_text: str, table_filter: str = "") -> str:
 _DDL_SCRIPT_NAME = "SCR_DDL_GetTableDDL"
 
 
+async def _fetch_base_table_ddl() -> str | None:
+    """Call the DDL script to get base-table DDL.
+
+    The FM script uses BaseTableNames(Get(FileName)) internally to return
+    DDL for only actual base tables, excluding Table Occurrences.
+
+    Returns:
+        Raw DDL text (CREATE TABLE statements), or None on failure.
+    """
+    try:
+        result = await odata_client.post(
+            f"Script.{_DDL_SCRIPT_NAME}",
+            json_body={"scriptParameterValue": '{"command": "list_base_tables"}'},
+        )
+        ddl_text = _extract_ddl_text(result)
+        if ddl_text:
+            set_script_available(True)
+            return ddl_text
+        return None
+    except ValueError as e:
+        if "not found" in str(e).lower():
+            logger.info("DDL script not found on this tenant")
+            set_script_available(False)
+        else:
+            logger.warning("DDL script error: %s", e)
+        return None
+    except (ConnectionError, PermissionError):
+        raise
+    except Exception:
+        logger.exception("Unexpected error calling DDL script")
+        return None
+
+
+def _extract_ddl_text(result: Any) -> str | None:
+    """Extract DDL text from a script call response.
+
+    Args:
+        result: Raw response dict from OData script call.
+
+    Returns:
+        DDL text string, or None if response is empty/error.
+    """
+    if not isinstance(result, dict):
+        return None
+    script_result = result.get("scriptResult", "")
+    ddl_text: str = ""
+    if isinstance(script_result, dict):
+        ddl_text = script_result.get("resultParameter", "") or ""
+    elif isinstance(script_result, str):
+        ddl_text = script_result
+    if not ddl_text:
+        ddl_text = str(result.get("value", ""))
+    if not ddl_text:
+        logger.warning("DDL script returned empty result")
+        return None
+    if ddl_text.strip().startswith("{"):
+        logger.warning("DDL script returned error: %s", ddl_text[:200])
+        return None
+    return ddl_text
+
+
 async def _refresh_ddl_via_script(table_names: list[str]) -> bool:
     """Attempt to refresh DDL by calling the FM GetTableDDL script via OData.
+
+    Used for on-demand single-table refresh (e.g. get_schema(refresh=True)).
+    Note: The current FM script uses BaseTableNames() and returns all base
+    tables regardless of the parameter. The result is still valid — we parse
+    and cache whatever comes back.
 
     Args:
         table_names: List of table names to fetch DDL for.
@@ -394,7 +586,6 @@ async def _refresh_ddl_via_script(table_names: list[str]) -> bool:
         True if script succeeded and TABLES was updated, False if script
         is unavailable and caller should fall back to $metadata.
     """
-    # Skip if we already know the script isn't available
     if is_script_available() is False:
         return False
 
@@ -404,30 +595,11 @@ async def _refresh_ddl_via_script(table_names: list[str]) -> bool:
             f"Script.{_DDL_SCRIPT_NAME}",
             json_body={"scriptParameterValue": param},
         )
-
-        # Extract DDL text from script result
-        # FM OData returns: {"scriptResult": {"code": 0, "resultParameter": "CREATE TABLE..."}}
-        ddl_text = ""
-        if isinstance(result, dict):
-            script_result = result.get("scriptResult", "")
-            if isinstance(script_result, dict):
-                ddl_text = script_result.get("resultParameter", "")
-            elif isinstance(script_result, str):
-                ddl_text = script_result
-            if not ddl_text:
-                ddl_text = result.get("value", "")
-
-        if not ddl_text or not isinstance(ddl_text, str):
-            logger.warning("DDL script returned empty result")
+        ddl_text = _extract_ddl_text(result)
+        if not ddl_text:
             return False
 
-        # Check for error JSON from the script
-        if ddl_text.strip().startswith("{"):
-            logger.warning("DDL script returned error: %s", ddl_text[:200])
-            return False
-
-        # Parse and update cache
-        parsed = parse_ddl(ddl_text)
+        parsed = parse_ddl(ddl_text, annotations=FIELD_ANNOTATIONS)
         if parsed:
             update_tables(parsed)
             set_script_available(True)
@@ -449,103 +621,155 @@ async def _refresh_ddl_via_script(table_names: list[str]) -> bool:
             logger.warning("DDL script error: %s", e)
         return False
     except (ConnectionError, PermissionError):
-        raise  # Let these propagate
+        raise
     except Exception:
         logger.exception("Unexpected error calling DDL script")
         return False
 
 
 async def bootstrap_ddl() -> None:
-    """Bootstrap DDL for all FM-visible tables on server startup.
+    """Bootstrap DDL for all FM-visible base tables on server startup.
 
-    Three-step sequence:
-    1. Probe: Check if the DDL script exists on FM.
-    2. Discover: Get table names from OData service document.
-    3. Fetch: Call DDL script with discovered tables + exponential backoff.
+    Six-step sequence:
+    1. OData discover: Get permitted EntitySet names (includes TOs).
+    2. DDL script: Fetch base-table DDL via FM script (uses BaseTableNames).
+    3. Intersect: EXPOSED_TABLES = base tables that are also OData-permitted.
+    4. Annotations: Fetch $metadata and extract field-level annotations.
+    5. Parse: Parse DDL with annotations, update TABLES cache.
+    6. Context: Load operational context from TBL_DDL_Context.
+
+    The DDL script uses FM's BaseTableNames() function which returns only
+    actual base tables, filtering out Table Occurrences (TOs). The OData
+    service document provides the permission gate — only tables the
+    authenticated user can access are exposed.
 
     If any step fails, the system degrades gracefully to static DDL.
     This is called from the server lifespan hook — before accepting connections.
     """
-    # Step 1: Probe — does the DDL script exist?
-    if is_script_available() is False:
-        logger.info("DDL bootstrap: script previously marked unavailable, skipping")
-        return
+    from filemaker_mcp.tools.query import merge_discovered_tables, set_bootstrap_error
 
-    try:
-        await odata_client.post(
-            f"Script.{_DDL_SCRIPT_NAME}",
-            json_body={"scriptParameterValue": "[]"},
-        )
-        set_script_available(True)
-        logger.info("DDL bootstrap step 1: script probe succeeded")
-    except ValueError as e:
-        if "not found" in str(e).lower():
-            logger.info("DDL bootstrap step 1: script not found, falling through to OData discovery")
-            set_script_available(False)
-        else:
-            # Other ValueError — script exists but errored, continue
-            set_script_available(True)
-            logger.warning("DDL bootstrap step 1: probe returned error, continuing: %s", e)
-    except PermissionError as e:
-        logger.error("DDL bootstrap step 1: authentication failed, skipping bootstrap")
-        from filemaker_mcp.tools.query import set_bootstrap_error
-
-        set_bootstrap_error(f"PermissionError: {e}")
-        return
-    except ConnectionError as e:
-        logger.warning("DDL bootstrap step 1: FM unreachable, using static DDL")
-        from filemaker_mcp.tools.query import set_bootstrap_error
-
-        set_bootstrap_error(f"ConnectionError: {e}")
-        return
-
-    # Step 2: Discover tables from OData service document
-    discovered = await _retry_with_backoff(
+    # Step 1: OData discover — get permitted EntitySet names
+    permitted = await _retry_with_backoff(
         _discover_tables_from_odata,
         max_retries=3,
         base_delay=1.0,
     )
-    if discovered:
-        table_names = discovered
-        logger.info("DDL bootstrap step 2: discovered %d tables from FM", len(table_names))
-        # Merge discovered tables into EXPOSED_TABLES
-        from filemaker_mcp.tools.query import merge_discovered_tables, set_bootstrap_error
+    if not permitted:
+        logger.error("DDL bootstrap step 1: OData discovery failed, no tables known")
+        set_bootstrap_error(_last_discovery_error or "OData discovery returned no tables")
+        return
+    permitted_set = set(permitted)
+    logger.info("DDL bootstrap step 1: OData reports %d permitted EntitySets", len(permitted_set))
+    set_bootstrap_error(None)  # Clear any stale error from a previous bootstrap attempt
 
-        merge_discovered_tables(table_names)
-        set_bootstrap_error(None)  # Clear any stale error from a previous attempt
-    else:
-        # Fallback to hardcoded EXPOSED_TABLES
-        table_names = list(EXPOSED_TABLES.keys())
+    # Step 2: DDL script — fetch base-table DDL
+    if is_script_available() is False:
+        logger.info("DDL bootstrap step 2: script previously unavailable, using OData list")
+        merge_discovered_tables(permitted)
+        return
+
+    ddl_text = await _fetch_base_table_ddl()
+    if not ddl_text:
+        # Script unavailable or failed — fall back to OData list (includes TOs)
         logger.warning(
-            "DDL bootstrap step 2: discovery failed, falling back to %d hardcoded tables",
-            len(table_names),
+            "DDL bootstrap step 2: DDL script failed, falling back to OData list (includes TOs)"
         )
-        if not table_names:
-            from filemaker_mcp.tools.query import set_bootstrap_error
+        merge_discovered_tables(permitted)
+        return
 
-            set_bootstrap_error(
-                _last_discovery_error or "OData discovery returned no tables"
-            )
+    # Extract base table names from DDL CREATE TABLE statements
+    base_table_names = re.findall(r'CREATE TABLE "([^"]+)"', ddl_text)
+    base_set = set(base_table_names)
+    logger.info("DDL bootstrap step 2: DDL script returned %d base tables", len(base_set))
 
-    # Step 3: Fetch DDL for all tables via script
-    async def _fetch_ddl() -> bool:
-        return await _refresh_ddl_via_script(table_names)
+    # Step 3: Intersect — only expose base tables that are OData-permitted
+    exposed = sorted(base_set & permitted_set)
+    filtered_tos = len(permitted_set) - len(exposed)
+    filtered_noaccess = len(base_set) - len(exposed)
+    merge_discovered_tables(exposed)
+    logger.info(
+        "DDL bootstrap step 3: %d permitted base tables "
+        "(%d TOs filtered, %d base tables without OData access filtered)",
+        len(exposed),
+        filtered_tos,
+        filtered_noaccess,
+    )
 
-    result = await _retry_with_backoff(_fetch_ddl, max_retries=3, base_delay=1.0)
-
-    if result:
-        missing = [t for t in table_names if t not in TABLES]
-        if missing:
-            logger.warning("DDL bootstrap step 3: missing tables after refresh: %s", missing)
+    # Step 4: Fetch $metadata annotations (Calculation, Summary, Global, FMComment)
+    try:
+        metadata_response = await odata_client.get("$metadata")
+        xml_text = metadata_response.get("metadata_xml", "")
+        if xml_text:
+            annotations = _extract_field_annotations(xml_text)
+            if annotations:
+                update_annotations(annotations)
+                ann_count = sum(len(fields) for fields in annotations.values())
+                logger.info(
+                    "DDL bootstrap step 4: extracted annotations for %d fields across %d tables",
+                    ann_count,
+                    len(annotations),
+                )
+            else:
+                logger.info("DDL bootstrap step 4: no field annotations found in $metadata")
         else:
-            logger.info("DDL bootstrap complete: all %d tables populated", len(table_names))
-    else:
+            logger.warning("DDL bootstrap step 4: empty $metadata response")
+    except Exception:
         logger.warning(
-            "DDL bootstrap step 3: DDL fetch failed after retries, "
-            "using static DDL fallback (%d of %d tables have static DDL)",
-            sum(1 for t in table_names if t in TABLES),
-            len(table_names),
+            "DDL bootstrap step 4: $metadata fetch failed, continuing without annotations"
         )
+
+    # Step 5: Parse DDL with annotations, update TABLES cache
+    parsed = parse_ddl(ddl_text, annotations=FIELD_ANNOTATIONS)
+    if parsed:
+        # Only keep tables that passed the intersection filter
+        exposed_set = set(exposed)
+        filtered_parsed = {k: v for k, v in parsed.items() if k in exposed_set}
+        update_tables(filtered_parsed)
+        logger.info(
+            "DDL bootstrap step 5: cached %d tables, %d fields",
+            len(filtered_parsed),
+            sum(len(f) for f in filtered_parsed.values()),
+        )
+    else:
+        logger.warning("DDL bootstrap step 5: DDL parsing failed")
+
+    # Step 6: Load operational context from TBL_DDL_Context
+    await _load_context()
+
+
+async def _load_context() -> None:
+    """Load operational context from TBL_DDL_Context into DDL_CONTEXT cache.
+
+    Runs as bootstrap step 6. Silently skips if table doesn't exist
+    or is unreachable — context is a nice-to-have, not required.
+    """
+    try:
+        data = await odata_client.get(
+            CONTEXT_TABLE,
+            params={"$orderby": "TableName,FieldName"},
+        )
+        records = data.get("value", [])
+        if records:
+            update_context(records)
+            logger.info(
+                "DDL bootstrap step 6: loaded %d context records from %s",
+                len(records),
+                CONTEXT_TABLE,
+            )
+        else:
+            logger.info("DDL bootstrap step 6: no context records found")
+    except ValueError as e:
+        if "not found" in str(e).lower():
+            logger.debug("DDL bootstrap step 6: %s table not found, skipping", CONTEXT_TABLE)
+        else:
+            logger.warning("DDL bootstrap step 6: error loading context: %s", e)
+    except (ConnectionError, PermissionError):
+        logger.warning(
+            "DDL bootstrap step 6: cannot reach %s, skipping context load",
+            CONTEXT_TABLE,
+        )
+    except Exception:
+        logger.exception("DDL bootstrap step 6: unexpected error loading context")
 
 
 async def get_schema(table: str = "", refresh: bool = False, show_all: bool = False) -> str:
@@ -584,13 +808,13 @@ async def get_schema(table: str = "", refresh: bool = False, show_all: bool = Fa
 
         # No table specified — list available tables
         lines = [
-            "Available FileMaker tables (use get_schema(table='X') for field details):",
+            "Available tables (use get_schema(table='X') for field details):",
             "",
         ]
         for tbl, desc in EXPOSED_TABLES.items():
             lines.append(f"  {tbl}: {desc}")
         lines.append("")
-        lines.append("Tip: Call get_schema(table='Location') to see all fields for a table.")
+        lines.append("Tip: Call get_schema(table='TableName') to see all fields for a table.")
         return "\n".join(lines)
 
     except ConnectionError as e:

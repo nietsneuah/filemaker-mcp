@@ -3,13 +3,17 @@
 Load data from FM into named DataFrames, then run groupby/aggregate
 queries without additional FM round trips. Results are compact summary
 tables (~200 tokens) instead of raw records (~400K tokens).
+
+Table-level caching: query_records auto-populates _table_cache with one
+DataFrame per table, keyed by date range. Subsequent queries for the same
+table serve from cache if the date range is covered.
 """
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
-import pandas as pd
+import pandas as pd  # type: ignore[import-untyped]
 
 from filemaker_mcp.auth import odata_client
 from filemaker_mcp.ddl import TABLES
@@ -33,12 +37,186 @@ class DatasetEntry:
     select: str
     loaded_at: datetime
     row_count: int
+    date_field: str = ""  # from cache_config, "" for cache_all/named
+    date_min: date | None = None  # earliest date in DataFrame
+    date_max: date | None = None  # latest date in DataFrame
+    pk_field: str = "PrimaryKey"  # from DDL, for dedup on merge
 
 
 # Session-persistent cache — keys are Claude-chosen dataset names.
 # Persists for MCP server process lifetime. No eviction needed —
 # business datasets are typically 1-5 MB each.
 _datasets: dict[str, DatasetEntry] = {}
+
+# Table-level cache — one DataFrame per table, keyed by table name.
+# Populated automatically by query_records when cache_config exists.
+_table_cache: dict[str, DatasetEntry] = {}
+
+MAX_ROWS_PER_TABLE = 50_000
+
+
+# --- Table cache management ---
+
+
+async def flush_datasets(table: str = "") -> str:
+    """Flush cached table DataFrames.
+
+    Args:
+        table: Specific table to flush. Empty = flush all.
+
+    Returns:
+        Confirmation message.
+    """
+    if table:
+        if table in _table_cache:
+            rows = _table_cache[table].row_count
+            del _table_cache[table]
+            return f"Flushed '{table}' ({rows} rows)."
+        return f"No cached data found for '{table}'."
+    count = len(_table_cache)
+    _table_cache.clear()
+    return f"Flushed {count} table cache(s)."
+
+
+def compute_date_gaps(
+    existing_min: str | None,
+    existing_max: str | None,
+    requested_min: str | None,
+    requested_max: str | None,
+) -> list[tuple[str | None, str | None]]:
+    """Compute date ranges that need fetching to satisfy the request.
+
+    Compares existing cached date range with requested range and returns
+    a list of (min, max) gap tuples that need fetching from FM.
+
+    Args:
+        existing_min: Cached range start (ISO string) or None if no cache.
+        existing_max: Cached range end (ISO string) or None if no cache.
+        requested_min: Requested range start or None (open-ended).
+        requested_max: Requested range end or None (open-ended).
+
+    Returns:
+        List of (min_date, max_date) tuples to fetch. Empty list = fully cached.
+    """
+    if existing_min is None or existing_max is None:
+        # No existing cache — fetch the full requested range
+        return [(requested_min, requested_max)]
+
+    e_min = date.fromisoformat(existing_min)
+    e_max = date.fromisoformat(existing_max)
+
+    r_min = date.fromisoformat(requested_min) if requested_min else None
+    r_max = date.fromisoformat(requested_max) if requested_max else None
+
+    gaps: list[tuple[str | None, str | None]] = []
+
+    # Gap before existing range
+    if r_min is not None and r_min < e_min:
+        gap_end = (e_min - timedelta(days=1)).isoformat()
+        gaps.append((r_min.isoformat(), gap_end))
+    elif r_min is None:
+        # Open-ended left — need everything before existing
+        gap_end = (e_min - timedelta(days=1)).isoformat()
+        gaps.append((None, gap_end))
+
+    # Gap after existing range
+    if r_max is not None and r_max > e_max:
+        gap_start = (e_max + timedelta(days=1)).isoformat()
+        gaps.append((gap_start, r_max.isoformat()))
+    elif r_max is None:
+        # Open-ended right — need everything after existing
+        gap_start = (e_max + timedelta(days=1)).isoformat()
+        gaps.append((gap_start, None))
+
+    return gaps
+
+
+def _enforce_row_limit(df: pd.DataFrame, date_field: str, table: str) -> pd.DataFrame:
+    """Truncate DataFrame to MAX_ROWS_PER_TABLE, keeping most recent rows."""
+    if len(df) <= MAX_ROWS_PER_TABLE:
+        return df
+    before = len(df)
+    if date_field and date_field in df.columns:
+        df = df.sort_values(date_field, ascending=False).head(MAX_ROWS_PER_TABLE)
+    else:
+        df = df.tail(MAX_ROWS_PER_TABLE)
+    logger.warning(
+        "Table cache for '%s' exceeded %d rows (%d) — truncated to %d most recent",
+        table,
+        MAX_ROWS_PER_TABLE,
+        before,
+        len(df),
+    )
+    return df.reset_index(drop=True)
+
+
+def merge_into_table_cache(
+    table: str,
+    new_df: pd.DataFrame,
+    date_field: str,
+    pk_field: str,
+    date_min: str | None,
+    date_max: str | None,
+) -> None:
+    """Merge new records into the table cache, deduplicating on PK.
+
+    If no cache exists for the table, creates a new entry.
+    If cache exists, concatenates and deduplicates on pk_field,
+    then updates date bounds to the union of old and new ranges.
+
+    Args:
+        table: Table name (key in _table_cache).
+        new_df: New records to merge.
+        date_field: Date field name for this table.
+        pk_field: Primary key field for deduplication.
+        date_min: New range lower bound (ISO string or None).
+        date_max: New range upper bound (ISO string or None).
+    """
+    d_min = date.fromisoformat(date_min) if date_min else None
+    d_max = date.fromisoformat(date_max) if date_max else None
+
+    if table not in _table_cache:
+        df = _enforce_row_limit(new_df, date_field, table)
+        _table_cache[table] = DatasetEntry(
+            df=df,
+            table=table,
+            filter="",
+            select="",
+            loaded_at=datetime.now(),
+            row_count=len(df),
+            date_field=date_field,
+            date_min=d_min,
+            date_max=d_max,
+            pk_field=pk_field,
+        )
+        return
+
+    existing = _table_cache[table]
+    combined = pd.concat([existing.df, new_df], ignore_index=True)
+
+    # Deduplicate on PK — keep last (new data wins)
+    if pk_field in combined.columns:
+        combined = combined.drop_duplicates(subset=[pk_field], keep="last")
+
+    combined = _enforce_row_limit(combined, date_field, table)
+
+    # Update date bounds to union
+    new_min = d_min
+    new_max = d_max
+    if existing.date_min and new_min:
+        new_min = min(existing.date_min, new_min)
+    elif existing.date_min:
+        new_min = existing.date_min
+    if existing.date_max and new_max:
+        new_max = max(existing.date_max, new_max)
+    elif existing.date_max:
+        new_max = existing.date_max
+
+    existing.df = combined
+    existing.row_count = len(combined)
+    existing.date_min = new_min
+    existing.date_max = new_max
+    existing.loaded_at = datetime.now()
 
 
 async def list_datasets() -> str:
@@ -92,7 +270,7 @@ async def load_dataset(
 
     try:
         # Fetch with auto-pagination
-        all_records: list[dict] = []
+        all_records: list[dict[str, object]] = []
         skip = 0
         while True:
             page_params = {**params}
@@ -110,14 +288,17 @@ async def load_dataset(
         if not all_records:
             return f"0 records matched filter for '{table}'. Dataset '{name}' not created."
 
-        # Build DataFrame
+        # Build DataFrame, dropping OData metadata columns
         df = pd.DataFrame(all_records)
+        meta_cols = [c for c in df.columns if c.startswith("@")]
+        if meta_cols:
+            df = df.drop(columns=meta_cols)
 
         # Convert date columns using DDL type info
         table_ddl = TABLES.get(table, {})
         for field_name, field_def in table_ddl.items():
             if field_def.get("type") in ("date", "datetime") and field_name in df.columns:
-                df[field_name] = pd.to_datetime(df[field_name], errors="coerce")
+                df[field_name] = pd.to_datetime(df[field_name], format="mixed", errors="coerce")
 
         # Store in session cache
         entry = DatasetEntry(
@@ -150,7 +331,7 @@ async def load_dataset(
         return f"Error loading dataset: {type(e).__name__}: {e}"
 
 
-_SUPPORTED_AGGS = {"sum", "count", "mean", "min", "max"}
+_SUPPORTED_AGGS = {"sum", "count", "mean", "min", "max", "median", "nunique", "std"}
 
 
 def _parse_aggregates(
@@ -169,7 +350,7 @@ def _parse_aggregates(
         if ":" not in pair:
             return (
                 f"Invalid aggregate format: '{pair}'. "
-                "Expected 'function:field' (e.g., 'sum:InvoiceTotal')."
+                "Expected 'function:field' (e.g., 'sum:Amount')."
             )
         func, field = pair.split(":", 1)
         func = func.strip().lower()
@@ -187,6 +368,9 @@ def _parse_aggregates(
     return agg_dict
 
 
+_PERIOD_FREQS = {"week": "W", "month": "ME", "quarter": "QE"}
+
+
 async def analyze(
     dataset: str,
     groupby: str = "",
@@ -194,29 +378,40 @@ async def analyze(
     filter: str = "",
     sort: str = "",
     limit: int = 50,
+    period: str = "",
+    pivot_column: str = "",
 ) -> str:
     """Run aggregation on a stored dataset. No FM round trip -- pure pandas.
 
     Args:
-        dataset: Name of a previously loaded dataset.
-        groupby: Comma-separated field names (e.g., "Driver,Zone").
+        dataset: Name of a previously loaded dataset, or a table name
+            from the table cache (auto-populated by query_records).
+        groupby: Comma-separated field names (e.g., "Technician,Region").
         aggregate: Comma-separated function:field pairs
-            (e.g., "sum:InvoiceTotal,count:InvoiceTotal").
-        filter: Pandas query expression to narrow data before aggregating (e.g., "Zone == 'A'").
-        sort: Sort result by column (e.g., "InvoiceTotal_sum desc").
+            (e.g., "sum:Amount,count:Amount").
+        filter: Pandas query expression to narrow data before aggregating (e.g., "Region == 'A'").
+        sort: Sort result by column (e.g., "Amount_sum desc").
         limit: Max rows in output (default 50).
+        period: Time-series resampling — "week", "month", or "quarter".
+            Requires groupby to include a datetime column.
+        pivot_column: Cross-tabulate by this column (creates a pivot table).
+            Requires groupby for row index and aggregate for values.
 
     Returns:
         Formatted text table with results.
     """
-    if dataset not in _datasets:
-        available = ", ".join(_datasets.keys()) if _datasets else "(none)"
+    # Resolve dataset — named datasets take precedence, then table cache
+    if dataset in _datasets:
+        entry = _datasets[dataset]
+    elif dataset in _table_cache:
+        entry = _table_cache[dataset]
+    else:
+        available = ", ".join(list(_datasets.keys()) + list(_table_cache.keys())) or "(none)"
         return (
-            f"Dataset '{dataset}' not found. Loaded datasets: {available}. "
-            "Use fm_load_dataset to load data first."
+            f"Dataset '{dataset}' not found. Available: {available}. "
+            "Use fm_load_dataset to load data, or query a cached table first."
         )
 
-    entry = _datasets[dataset]
     df = entry.df.copy()
 
     # Apply pandas filter
@@ -239,6 +434,95 @@ async def analyze(
         if field not in df.columns:
             return f"Field '{field}' not in dataset. Available: {', '.join(df.columns.tolist())}"
 
+    # --- Time-series mode ---
+    if period:
+        if period not in _PERIOD_FREQS:
+            return f"Invalid period '{period}'. Supported: {', '.join(_PERIOD_FREQS.keys())}"
+        freq = _PERIOD_FREQS[period]
+        if not groupby_fields:
+            return "Period requires a groupby field (the date column)."
+        date_col = groupby_fields[0]
+        if date_col not in df.columns or not pd.api.types.is_datetime64_any_dtype(df[date_col]):
+            return f"Field '{date_col}' must be a datetime column for period grouping."
+
+        agg_dict = _parse_aggregates(aggregate, df.columns.tolist())
+        if isinstance(agg_dict, str):
+            return agg_dict
+
+        grouper: list[pd.Grouper | str] = [pd.Grouper(key=date_col, freq=freq)]
+        if len(groupby_fields) > 1:
+            grouper.extend(groupby_fields[1:])
+
+        try:
+            result_df = df.groupby(grouper).agg(agg_dict)
+        except Exception as e:
+            return f"Time-series aggregation error: {e}"
+
+        result_df.columns = [f"{col}_{func}" for col, func in result_df.columns]
+        result_df = result_df.reset_index()
+
+        # Format date column for readability
+        if date_col in result_df.columns:
+            result_df[date_col] = result_df[date_col].dt.strftime("%Y-%m")
+
+        if sort:
+            parts = sort.strip().split()
+            sort_col = parts[0]
+            ascending = not (len(parts) > 1 and parts[1].lower() == "desc")
+            if sort_col in result_df.columns:
+                result_df = result_df.sort_values(sort_col, ascending=ascending)
+
+        total_groups = len(result_df)
+        result_df = result_df.head(limit)
+        result_str = result_df.to_string(index=False)
+        return (
+            f"Time-series analysis of '{dataset}' ({len(df)} records, {period}ly):\n\n"
+            f"{result_str}\n\n"
+            f"({total_groups} periods)"
+        )
+
+    # --- Pivot mode ---
+    if pivot_column:
+        if pivot_column not in df.columns:
+            cols = ", ".join(df.columns.tolist())
+            return f"Pivot column '{pivot_column}' not in dataset. Available: {cols}"
+        if not groupby_fields:
+            return "Pivot requires a groupby field for row index."
+        agg_dict = _parse_aggregates(aggregate, df.columns.tolist())
+        if isinstance(agg_dict, str):
+            return agg_dict
+        if not agg_dict:
+            return "Pivot requires an aggregate (e.g., 'count:Amount')."
+
+        # Use first agg field and function for pivot
+        agg_field = next(iter(agg_dict.keys()))
+        agg_func = agg_dict[agg_field][0]
+
+        try:
+            result_df = pd.pivot_table(
+                df,
+                index=groupby_fields,
+                columns=pivot_column,
+                values=agg_field,
+                aggfunc=agg_func,
+                fill_value=0,
+            )
+        except Exception as e:
+            return f"Pivot error: {e}"
+
+        result_df = result_df.reset_index()
+        total_groups = len(result_df)
+        result_df = result_df.head(limit)
+        result_str = result_df.to_string(index=False)
+        return (
+            f"Pivot analysis of '{dataset}' ({len(df)} records):\n"
+            f"Rows: {', '.join(groupby_fields)} | Columns: {pivot_column} "
+            f"| Values: {agg_func}({agg_field})\n\n"
+            f"{result_str}\n\n"
+            f"({total_groups} rows)"
+        )
+
+    # --- Standard groupby/aggregate ---
     if groupby and not aggregate:
         # Value counts per group
         if len(groupby_fields) == 1:
@@ -266,7 +550,7 @@ async def analyze(
         except Exception as e:
             return f"Aggregation error: {e}"
 
-        # Flatten multi-level column names: (InvoiceTotal, sum) -> InvoiceTotal_sum
+        # Flatten multi-level column names: (Amount, sum) -> Amount_sum
         result_df.columns = [f"{col}_{func}" for col, func in result_df.columns]
         result_df = result_df.reset_index()
     else:

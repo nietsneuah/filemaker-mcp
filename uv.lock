@@ -423,7 +423,7 @@ wheels = [
 ]
 
 [[package]]
-name = "filemaker-mcp"
+name = "fmrug-mcp"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
@@ -438,6 +438,7 @@ dev = [
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "rich" },
     { name = "ruff" },
 ]
 
@@ -455,6 +456,7 @@ dev = [
     { name = "mypy", specifier = ">=1.14.0" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
+    { name = "rich", specifier = ">=13.0.0" },
     { name = "ruff", specifier = ">=0.9.0" },
 ]
 

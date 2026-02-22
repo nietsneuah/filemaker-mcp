@@ -2,7 +2,7 @@
 
 Converts raw SQL DDL (CREATE TABLE statements) into the structured
 FieldDef format used by the schema tools. Handles FM-specific type
-mapping and applies tier heuristics for field classification.
+mapping and applies tier classification for fields.
 
 Type mapping:
   varchar(255)     -> text
@@ -10,15 +10,20 @@ Type mapping:
   datetime         -> datetime
   varbinary(4096)  -> binary
 
-Tier heuristics:
-  _kp_*            -> key + pk
-  _kf_*            -> key + fk
-  _sp_*            -> internal (speed/UI cache)
-  g + uppercase    -> internal (global)
-  G_*              -> internal (global)
+Tier assignment priority (first match wins):
+  1. Name: _kp_* / _kf_*           -> key (primary/foreign key)
+  2. Annotation: Calculation=true   -> internal (from $metadata)
+  3. Annotation: Summary=true       -> internal (from $metadata)
+  4. Annotation: Global=true        -> internal (from $metadata)
+  5. Name: _sp_*                    -> internal (speed/UI cache)
+  6. Name: g+Upper / G_*           -> internal (global)
+  7. Default                        -> standard
+
+When annotations are unavailable, only name heuristics are used.
 """
 
 import re
+from typing import Any
 
 from filemaker_mcp.ddl import FieldDef, TableSchema
 
@@ -49,10 +54,28 @@ def _map_type(sql_type: str) -> str:
     return _TYPE_MAP.get(base, "text")
 
 
-def _assign_tier(field_name: str) -> str:
-    """Apply tier heuristics based on field name conventions."""
+def _assign_tier(field_name: str, annotations: dict[str, Any] | None = None) -> str:
+    """Apply tier classification: annotations first, then name heuristics.
+
+    Args:
+        field_name: The field name to classify.
+        annotations: Optional FieldAnnotations dict for this specific field.
+            If present, Calculation/Summary/Global override name heuristics.
+
+    Returns:
+        Tier string: "key", "internal", or "standard".
+    """
+    # Name-based key detection always wins (PK/FK fields are always key)
     if field_name.startswith("_kp_") or field_name.startswith("_kf_"):
         return "key"
+
+    # Annotation-based classification (highest priority after key)
+    if annotations and (
+        annotations.get("calculation") or annotations.get("summary") or annotations.get("global_")
+    ):
+        return "internal"
+
+    # Name-based heuristics (fallback)
     if field_name.startswith("_sp_"):
         return "internal"
     # g + uppercase letter = global (e.g., gGlobal, gDate)
@@ -63,11 +86,17 @@ def _assign_tier(field_name: str) -> str:
     return "standard"
 
 
-def parse_ddl(ddl_text: str) -> dict[str, TableSchema]:
+def parse_ddl(
+    ddl_text: str,
+    annotations: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, TableSchema]:
     """Parse DDL text into structured table/field definitions.
 
     Args:
         ddl_text: Raw DDL from GetTableDDL() — one or more CREATE TABLE statements.
+        annotations: Optional per-table, per-field annotation dicts from $metadata.
+            Structure: {table_name: {field_name: FieldAnnotations}}.
+            Used for tier classification and description population.
 
     Returns:
         Dict mapping table_name -> {field_name: FieldDef}.
@@ -94,15 +123,22 @@ def parse_ddl(ddl_text: str) -> dict[str, TableSchema]:
                 fk_fields.add(fk_name.strip().strip('"'))
 
         # Parse field definitions
+        table_ann = (annotations or {}).get(table_name, {})
         fields: TableSchema = {}
         for field_match in _FIELD_RE.finditer(body):
             field_name = field_match.group(1)
             sql_type = field_match.group(2)
 
+            field_ann = table_ann.get(field_name)
+
             field_def: FieldDef = {
                 "type": _map_type(sql_type),
-                "tier": _assign_tier(field_name),
+                "tier": _assign_tier(field_name, field_ann),
             }
+
+            # Populate description from FMComment annotation
+            if field_ann and field_ann.get("comment"):
+                field_def["description"] = field_ann["comment"]
 
             # Apply PK/FK from constraints
             if field_name in pk_fields:

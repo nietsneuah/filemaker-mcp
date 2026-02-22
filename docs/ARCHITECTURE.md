@@ -33,7 +33,7 @@
 └─────────┼───────────────────────────────────────────┘
           │ HTTPS
 ┌─────────▼───────────────────────────────────────────┐
-│  FileMaker Server 22  (your-server.example.com)            │
+│  FileMaker Server 22  (your-server.example.com)       │
 │  ├─ OData v4 API    (/fmi/odata/v4/)                │
 │  │   Basic auth, read queries, $metadata             │
 │  ├─ Data API        (/fmi/data/vLatest/)             │

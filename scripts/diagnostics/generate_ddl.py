@@ -18,9 +18,14 @@ import httpx
 
 from filemaker_mcp.config import settings
 
-# Add your table names here, or leave empty to use all
-# tables discovered from the OData service document.
-EXPOSED_TABLES: list[str] = []
+EXPOSED_TABLES = [
+    "Location",
+    "Customers",
+    "Invoices",
+    "LineItems",
+    "Orders",
+    "Drivers",
+]
 
 DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
